@@ -364,7 +364,7 @@ def evaluate_agent(model, env: TradingEnv) -> dict:
     max_dd     = _max_drawdown(vals)
     win_rate   = wins / trades if trades > 0 else 0.0
 
-    return {
+    result = {
         "cumulative_return": float(cum_return),
         "sharpe_ratio":      float(sharpe),
         "win_rate":          float(win_rate),
@@ -372,6 +372,43 @@ def evaluate_agent(model, env: TradingEnv) -> dict:
         "n_trades":          trades,
         "final_value":       float(vals[-1]),
     }
+
+    # ── Completed-trade metrics (primary result summary) ──────────────────────
+    ct = env.completed_trade_log
+    if ct:
+        df_ct = pd.DataFrame(ct)
+        ct_n           = len(df_ct)
+        ct_net_pnl     = float(df_ct["net_pnl"].sum())
+        ct_wins        = int((df_ct["net_pnl"] > 0).sum())
+        ct_win_rate    = ct_wins / ct_n if ct_n > 0 else 0.0
+        gross_profit   = float(df_ct.loc[df_ct["net_pnl"] > 0, "net_pnl"].sum())
+        gross_loss     = abs(float(df_ct.loc[df_ct["net_pnl"] <= 0, "net_pnl"].sum()))
+        profit_factor  = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        total_tc       = float(df_ct["transaction_cost_total"].sum())
+        ct_return_pct  = ct_net_pnl / INITIAL_CASH * 100.0
+        exit_counts    = df_ct["exit_reason"].value_counts().to_dict()
+
+        result.update({
+            "completed_trades":       ct_n,
+            "closed_trade_net_pnl":   ct_net_pnl,
+            "closed_trade_return_pct": ct_return_pct,
+            "closed_trade_win_rate":  ct_win_rate,
+            "profit_factor":          profit_factor,
+            "total_transaction_costs": total_tc,
+            "exit_reason_counts":     exit_counts,
+        })
+    else:
+        result.update({
+            "completed_trades":       0,
+            "closed_trade_net_pnl":   0.0,
+            "closed_trade_return_pct": 0.0,
+            "closed_trade_win_rate":  0.0,
+            "profit_factor":          0.0,
+            "total_transaction_costs": 0.0,
+            "exit_reason_counts":     {},
+        })
+
+    return result
 
 
 def buy_and_hold(df: pd.DataFrame) -> dict:
@@ -465,16 +502,17 @@ def train_asset(
         verbose=0,
     )
 
+    # v2: more stable PPO hyperparameters to reduce overtrading / exploration noise
     model = PPO(
         "MlpPolicy", train_env,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         n_steps=2048,
-        batch_size=64,
+        batch_size=128,
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
+        clip_range=0.15,
+        ent_coef=0.003,
         verbose=0,
     )
 
@@ -526,6 +564,7 @@ def run_asset(
     signal_threshold: float = None,
     opportunity_threshold: float = None,
     seed: int = None,
+    output_suffix: str = "",
 ) -> dict:
     """Full Phase 7 pipeline for one asset."""
     from models.feature_schema import get_feature_columns
@@ -623,8 +662,10 @@ def run_asset(
         return {}
 
     # Save step-level and trade-history CSVs
-    save_trade_log_csv(test_env, asset, target_horizon, target_mode, leverage)
-    save_trade_history_csv(test_env, asset, target_horizon, target_mode, leverage)
+    _base_dir = Path(__file__).parent.parent / "data" / "dashboard"
+    _out_dir  = (_base_dir / output_suffix) if output_suffix else _base_dir
+    save_trade_log_csv(test_env, asset, target_horizon, target_mode, leverage, output_dir=_out_dir)
+    save_trade_history_csv(test_env, asset, target_horizon, target_mode, leverage, output_dir=_out_dir)
 
     # Summary log
     _log_trade_summary(test_env, asset, rl_metrics)
@@ -807,6 +848,7 @@ def run(
     signal_threshold: float = None,
     opportunity_threshold: float = None,
     seed: int = None,
+    output_suffix: str = "",
 ) -> dict:
     assets = assets or ALL_ASSETS
     ordered = (["BTC"] + [a for a in assets if a != "BTC"]
@@ -829,6 +871,7 @@ def run(
                 signal_threshold=signal_threshold,
                 opportunity_threshold=opportunity_threshold,
                 seed=seed,
+                output_suffix=output_suffix,
             )
         except Exception as e:
             logger.error(f"{asset}: RL pipeline failed — {e}")
@@ -873,6 +916,12 @@ def main():
     parser.add_argument("--check-rl-logs", action="store_true",
                         help="Read saved CSV logs and print diagnostics; no training")
     parser.add_argument("--use-gdelt-sentiment", action="store_true")
+    parser.add_argument(
+        "--output-suffix", default="",
+        help="Subfolder name under data/dashboard/ for output CSVs "
+             "(e.g. 'rl_test_v2' saves to data/dashboard/rl_test_v2/). "
+             "Empty string writes to data/dashboard/ (default, overwrites old files)."
+    )
     args = parser.parse_args()
 
     # Resolve timesteps
@@ -933,6 +982,7 @@ def main():
         signal_threshold=args.signal_threshold,
         opportunity_threshold=args.opportunity_threshold,
         seed=args.seed,
+        output_suffix=args.output_suffix,
     )
 
     logger.info("\nFinal summary:")
@@ -942,7 +992,13 @@ def main():
             logger.info(
                 f"  {asset}: ret={rl.get('cumulative_return', float('nan')):.2%}  "
                 f"sharpe={rl.get('sharpe_ratio', float('nan')):.3f}  "
-                f"dd={rl.get('max_drawdown', float('nan')):.2%}"
+                f"dd={rl.get('max_drawdown', float('nan')):.2%}  "
+                f"completed_trades={rl.get('completed_trades', '?')}  "
+                f"net_pnl={rl.get('closed_trade_net_pnl', float('nan')):+.2f}  "
+                f"ct_ret={rl.get('closed_trade_return_pct', float('nan')):+.2f}%  "
+                f"win_rate={rl.get('closed_trade_win_rate', float('nan')):.1%}  "
+                f"pf={rl.get('profit_factor', float('nan')):.2f}  "
+                f"exits={rl.get('exit_reason_counts', {})}"
             )
 
 

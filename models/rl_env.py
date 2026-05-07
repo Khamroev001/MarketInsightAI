@@ -81,6 +81,101 @@ SL_PENALTY_VALUE        = 0.005
 
 SAVED_DIR = Path(__file__).parent / "saved"
 
+# ── v2 Feature Flags ──────────────────────────────────────────────────────────
+# USE_OLD_PNL_TIMING=True → old behavior: new position earns the current bar.
+# USE_OLD_PNL_TIMING=False → new (correct): old position earns the current bar;
+#   new action only affects future returns.
+USE_OLD_PNL_TIMING    = False
+
+# USE_CLOSE_ONLY_TPSL=True → old behavior: TP/SL checked against close price only.
+# USE_CLOSE_ONLY_TPSL=False → new: LONG SL uses candle low, TP uses candle high;
+#   SHORT SL uses candle high, TP uses candle low. SL always takes priority.
+USE_CLOSE_ONLY_TPSL   = False
+
+# Minimum bars a trade must be held before agent can close/resize/reverse.
+# TP/SL exits are always allowed regardless of this setting.
+MIN_HOLD_BARS         = 3
+
+# Bars agent is forced to HOLD after any close/resize/reverse (reduces overtrading).
+# TP/SL exits still trigger cooldown; forced TP/SL exits bypass cooldown enforcement.
+COOLDOWN_BARS         = 2
+
+# Per-event reward penalties for reverse and resize (tunable here or as __init__ params).
+REVERSE_PENALTY_VALUE = 0.003
+RESIZE_PENALTY_VALUE  = 0.0015
+
+# ── v3 Feature Flags ──────────────────────────────────────────────────────────
+# Set any flag to False to revert that feature to v2 behavior.
+USE_ASSET_SPECIFIC_GATES     = True  # A+F+G: asset-specific entry gates/restrictions
+USE_SIGNAL_DIRECTION_FILTER  = True  # B: require trend agreement for new entries
+USE_ASSET_SPECIFIC_RISK_LIMITS = True  # C: cap risk profile by asset+signal
+USE_BREAKEVEN_STOP           = True  # D: move SL to entry after favourable excursion
+USE_LOSS_CLOSE_PENALTY       = True  # E: reward signal at completed-trade close
+
+# A: minimum signal_strength to open a new position, by asset.
+# signal_strength = abs(predicted_log_return); typical range 0.001–0.009.
+# signal_strength is preferred; abs(predicted_log_return) used as fallback.
+ASSET_SIGNAL_THRESHOLDS = {
+    "BTC":  0.00,    # no restriction on BTC
+    "ETH":  0.0020,  # ~p60 of ETH signal distribution
+    "GOLD": 0.0035,  # ~p75 of GOLD signal distribution
+    "OIL":  0.0035,  # ~p65 of OIL signal distribution
+}
+
+# B: direction filter tolerance — allow this much counter-trend noise for new entries
+DIRECTION_TOLERANCE = 0.0005
+
+# C: maximum allowed risk_idx per asset (0=CONSERVATIVE 1=BALANCED 2=AGGRESSIVE).
+# Further down-capping is done dynamically based on signal_strength.
+ASSET_MAX_RISK_IDX = {
+    "BTC":  2,
+    "ETH":  1,    # BALANCED cap; AGGRESSIVE allowed only if ss >= ETH_AGG_SIGNAL_MIN
+    "GOLD": 0,    # CONSERVATIVE cap; BALANCED allowed only if ss >= GOLD_OIL_BAL_SIGNAL_MIN
+    "OIL":  0,
+}
+ETH_AGG_SIGNAL_MIN       = 0.005   # ETH: allow AGGRESSIVE if signal_strength >= this (~p90)
+GOLD_OIL_BAL_SIGNAL_MIN  = 0.006   # GOLD/OIL: allow BALANCED if signal_strength >= this (~p90)
+
+# D: breakeven-stop trigger distance in ATR multiples (999 = disabled)
+BREAKEVEN_TRIGGER_ATR = {
+    "BTC":  999.0,
+    "ETH":  0.8,
+    "GOLD": 0.7,
+    "OIL":  0.7,
+}
+
+# E: per-trade reward signals applied at actual trade close
+LOSS_CLOSE_PENALTY = {
+    "BTC":  0.0,
+    "ETH":  0.002,
+    "GOLD": 0.003,
+    "OIL":  0.003,
+}
+WIN_CLOSE_BONUS = {
+    "BTC":  0.0,
+    "ETH":  0.001,
+    "GOLD": 0.001,
+    "OIL":  0.001,
+}
+
+# F: GOLD/OIL resize and reverse restrictions
+GOLD_OIL_MIN_HOLD_BEFORE_RESIZE = 5      # bars before GOLD/OIL resize is allowed
+GOLD_OIL_REVERSE_SIGNAL_MIN     = 0.006  # GOLD/OIL reverse requires signal_strength >= this (~p90)
+ETH_REVERSE_SIGNAL_MIN          = 0.004  # ETH reverse requires signal_strength >= this (~p80)
+
+# G: OIL short-bias guard
+OIL_SHORT_BIAS_LOOKBACK  = 20     # consider this many recent completed trades
+OIL_SHORT_BIAS_MAX_RATIO = 0.70   # block new SHORT if >= this fraction of recent are SHORT
+OIL_SHORT_BIAS_MIN_SS    = 0.006  # override bias block if signal_strength >= this (~p90)
+
+# H: per-asset min-hold override (overrides global MIN_HOLD_BARS when USE_ASSET_SPECIFIC_GATES)
+ASSET_MIN_HOLD_BARS = {
+    "BTC":  3,
+    "ETH":  2,    # ETH gets slightly shorter hold to allow more timely exits
+    "GOLD": 3,
+    "OIL":  3,
+}
+
 # ── MultiDiscrete action decoders ─────────────────────────────────────────────
 
 DIRECTION_NAMES = {0: "HOLD", 1: "FLAT", 2: "LONG", 3: "SHORT"}
@@ -127,6 +222,29 @@ _TRANSFORMER_SIGNAL_DIM = len(TRANSFORMER_FEAT_COLS)
 FEATURE_COLS            = MARKET_FEATURE_COLS + TRANSFORMER_FEAT_COLS
 _EXTRA_DIM              = 7
 STATE_DIM               = len(FEATURE_COLS) + _EXTRA_DIM
+
+
+# ── v3 helper: asset-specific risk-profile cap ────────────────────────────────
+
+def _apply_asset_risk_limits(asset: str, risk_idx: int, sig_str: float) -> int:
+    """Downgrade risk_idx if the asset+signal combination does not justify it.
+
+    Returns the (possibly reduced) risk_idx.
+    """
+    if not USE_ASSET_SPECIFIC_RISK_LIMITS:
+        return risk_idx
+    a = (asset or "").upper()
+    if a == "ETH":
+        if risk_idx == 2 and sig_str < ETH_AGG_SIGNAL_MIN:
+            risk_idx = 1   # AGGRESSIVE → BALANCED
+    elif a in ("GOLD", "OIL"):
+        if risk_idx == 2:
+            risk_idx = 0   # AGGRESSIVE always → CONSERVATIVE for GOLD/OIL
+        elif risk_idx == 1 and sig_str < GOLD_OIL_BAL_SIGNAL_MIN:
+            risk_idx = 0   # BALANCED → CONSERVATIVE if signal not strong enough
+    # Hard cap
+    risk_idx = min(risk_idx, ASSET_MAX_RISK_IDX.get(a, 2))
+    return risk_idx
 
 
 # ── Load Transformer predictions ──────────────────────────────────────────────
@@ -393,6 +511,18 @@ class TradingEnv(gym.Env):
         normed_trans = self._normalise_transformer(self._transformer_raw)
         self._features = np.concatenate([normed_market, normed_trans], axis=1)
 
+        # v3: raw price-return arrays for direction-agreement filter (B)
+        self._ret4_raw = (
+            self.df["ret_4"].values.astype(np.float32)
+            if "ret_4" in self.df.columns
+            else np.zeros(self.n_steps, dtype=np.float32)
+        )
+        self._ret1_raw = (
+            self.df["ret_1"].values.astype(np.float32)
+            if "ret_1" in self.df.columns
+            else np.zeros(self.n_steps, dtype=np.float32)
+        )
+
         # ATR array (used to fix TP/SL prices at entry)
         if "atr_14" in self.df.columns:
             raw_atr = self.df["atr_14"].values.astype(np.float64)
@@ -485,7 +615,12 @@ class TradingEnv(gym.Env):
         self.completed_trade_log     = []
         self._step                   = 0
         self.done                    = False
-        self._tacc_portfolio_delta = 0.0
+        self._tacc_portfolio_delta   = 0.0
+        # v2: cooldown / min-hold tracking
+        self._cooldown_remaining     = 0
+        # v3: extended state
+        self._recent_closed_sides    = []   # for OIL short-bias tracking (G)
+        self._n_breakeven_stop_updates = 0  # metric counter (D)
 
     # ── Gym interface ─────────────────────────────────────────────────────────
 
@@ -529,10 +664,11 @@ class TradingEnv(gym.Env):
                 self.rolling_vol_20 = float(np.std(self._log_returns_buf))
 
         # Transformer signal
-        trans        = self._transformer_raw[idx]
-        predicted_lr = float(trans[0])
-        signal_str   = float(trans[1])
-        derived_dir  = int(trans[2])
+        trans          = self._transformer_raw[idx]
+        predicted_lr   = float(trans[0])
+        signal_str     = float(trans[1])
+        derived_dir    = int(trans[2])
+        _asset_upper   = (self._asset or "").upper()  # reused throughout step
 
         # ATR for TP/SL fixing at entry
         atr_t = float(self._atr[idx])
@@ -545,18 +681,33 @@ class TradingEnv(gym.Env):
         max_hold_triggered = False
 
         if self.in_position and self._trade_sl_price is not None:
-            if self.trade_side == 1:
-                if price_t <= self._trade_sl_price:
+            _tp = self._trade_tp_price  # may be None (e.g. in tests that only set SL)
+            if self.trade_side == 1:  # LONG
+                if USE_CLOSE_ONLY_TPSL:
+                    _sl_hit = price_t <= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (price_t >= _tp)
+                else:
+                    # Use candle low for SL, high for TP. SL takes priority if both hit.
+                    _sl_hit = low_t  <= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (high_t >= _tp)
+                if _sl_hit:
                     dir_idx, sl_triggered = 1, True
                     self.metrics["n_stop_losses_hit"] += 1
-                elif price_t >= self._trade_tp_price:
+                elif _tp_hit:
                     dir_idx, tp_triggered = 1, True
                     self.metrics["n_take_profits_hit"] += 1
-            elif self.trade_side == -1:
-                if price_t >= self._trade_sl_price:
+            elif self.trade_side == -1:  # SHORT
+                if USE_CLOSE_ONLY_TPSL:
+                    _sl_hit = price_t >= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (price_t <= _tp)
+                else:
+                    # Use candle high for SL, low for TP. SL takes priority if both hit.
+                    _sl_hit = high_t >= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (low_t <= _tp)
+                if _sl_hit:
                     dir_idx, sl_triggered = 1, True
                     self.metrics["n_stop_losses_hit"] += 1
-                elif price_t <= self._trade_tp_price:
+                elif _tp_hit:
                     dir_idx, tp_triggered = 1, True
                     self.metrics["n_take_profits_hit"] += 1
 
@@ -564,6 +715,129 @@ class TradingEnv(gym.Env):
                     and self.steps_in_position >= self._max_holding_bars):
                 dir_idx, max_hold_triggered = 1, True
                 self.metrics["n_max_hold_exits"] += 1
+
+        # ── v3 D: Breakeven stop — move SL to entry after sufficient gain ────────
+        # Runs every step while in position (before cooldown/gate checks).
+        # Only moves SL in the protective direction. Never loosens the stop.
+        if (USE_BREAKEVEN_STOP
+                and self.in_position
+                and self.entry_price
+                and self._trade_sl_price is not None
+                and not tp_triggered and not sl_triggered):
+            _be_trigger = BREAKEVEN_TRIGGER_ATR.get(_asset_upper, 999.0)
+            if _be_trigger < 999.0:
+                if self.trade_side == 1:   # LONG: trigger if price moved up enough
+                    if price_t >= self.entry_price + _be_trigger * atr_t:
+                        _new_sl = self.entry_price
+                        if _new_sl > self._trade_sl_price:
+                            self._trade_sl_price = _new_sl
+                            self._n_breakeven_stop_updates += 1
+                            self.metrics["n_breakeven_stop_updates"] += 1
+                elif self.trade_side == -1:  # SHORT: trigger if price moved down enough
+                    if price_t <= self.entry_price - _be_trigger * atr_t:
+                        _new_sl = self.entry_price
+                        if _new_sl < self._trade_sl_price:
+                            self._trade_sl_price = _new_sl
+                            self._n_breakeven_stop_updates += 1
+                            self.metrics["n_breakeven_stop_updates"] += 1
+
+        # ── Cooldown: force HOLD for COOLDOWN_BARS steps after any close ────────
+        # TP/SL overrides skip cooldown enforcement (already set dir_idx=1).
+        if (self._cooldown_remaining > 0
+                and not tp_triggered and not sl_triggered and not max_hold_triggered):
+            dir_idx = 0  # HOLD
+
+        # ── Min-hold: block early close/reverse/resize (not TP/SL/MAX_HOLD) ──
+        # v3: use per-asset hold bars when USE_ASSET_SPECIFIC_GATES is on
+        _eff_min_hold = (
+            ASSET_MIN_HOLD_BARS.get(_asset_upper, MIN_HOLD_BARS)
+            if USE_ASSET_SPECIFIC_GATES else MIN_HOLD_BARS
+        )
+        if (self.in_position
+                and not tp_triggered and not sl_triggered and not max_hold_triggered
+                and self.steps_in_position < _eff_min_hold):
+            _new_sign = (1.0 if dir_idx == 2 else -1.0) if dir_idx in (2, 3) else 0.0
+            _old_sign = float(np.sign(self.current_position_pct))
+            _agent_wants_exit = (dir_idx == 1 or
+                                 (dir_idx in (2, 3) and _new_sign != _old_sign))
+            if _agent_wants_exit:
+                dir_idx = 0  # HOLD
+
+        # ── v3 A: Signal-strength gate — block weak new entries ──────────────
+        # Only blocks opening NEW positions; exits and holds are always allowed.
+        # TP/SL overrides are never blocked.
+        # Gate is skipped when signal_str == 0 AND predicted_lr == 0: that means
+        # no transformer prediction exists for this bar, not a genuinely weak signal.
+        if (USE_ASSET_SPECIFIC_GATES
+                and not tp_triggered and not sl_triggered and not max_hold_triggered
+                and not self.in_position
+                and dir_idx in (2, 3)):  # only LONG/SHORT when flat
+            _gate_thr = ASSET_SIGNAL_THRESHOLDS.get(_asset_upper, 0.0)
+            if _gate_thr > 0.0:
+                _gate_sig = signal_str if signal_str > 0 else abs(predicted_lr)
+                _has_prediction = _gate_sig > 0.0  # 0 = no prediction for this bar
+                if _has_prediction and _gate_sig < _gate_thr:
+                    dir_idx = 0  # HOLD — signal exists but is too weak
+
+        # ── v3 B: Direction-agreement filter for new entries ─────────────────
+        # Require that the predicted direction agrees with recent price trend.
+        # Only applied for new entries (flat→long/short), never for exits.
+        # Skipped when predicted_lr == 0 (no prediction for this bar).
+        if (USE_SIGNAL_DIRECTION_FILTER
+                and not tp_triggered and not sl_triggered and not max_hold_triggered
+                and not self.in_position
+                and dir_idx in (2, 3)):
+            _gate_thr = ASSET_SIGNAL_THRESHOLDS.get(_asset_upper, 0.0)
+            if _gate_thr > 0.0 and predicted_lr != 0.0:  # skip when no prediction exists
+                _trend = float(self._ret4_raw[idx]) if idx > 0 else 0.0
+                if _trend == 0.0:
+                    _trend = float(self._ret1_raw[idx]) if idx > 0 else 0.0
+                _allow_long  = predicted_lr > _gate_thr and _trend >= -DIRECTION_TOLERANCE
+                _allow_short = predicted_lr < -_gate_thr and _trend <= DIRECTION_TOLERANCE
+                if dir_idx == 2 and not _allow_long:
+                    dir_idx = 0
+                elif dir_idx == 3 and not _allow_short:
+                    dir_idx = 0
+
+        # ── v3 C: Asset-specific risk-profile cap ────────────────────────────
+        # Downgrade risk if asset+signal does not justify the requested level.
+        if dir_idx in (2, 3):
+            risk_idx = _apply_asset_risk_limits(_asset_upper, risk_idx, signal_str)
+
+        # ── v3 F: GOLD/OIL resize and reverse restrictions ───────────────────
+        # GOLD and OIL need stronger signal before reversing;
+        # resize is blocked until trade has been held long enough.
+        if (USE_ASSET_SPECIFIC_GATES
+                and self.in_position
+                and not tp_triggered and not sl_triggered and not max_hold_triggered
+                and dir_idx in (2, 3)):
+            _new_target_pct = SIZE_FRACTIONS[size_idx] * (1.0 if dir_idx == 2 else -1.0)
+            _is_reverse = np.sign(_new_target_pct) != np.sign(self.current_position_pct)
+            _is_resize  = (
+                not _is_reverse
+                and _new_target_pct != self.current_position_pct
+            )
+            if _asset_upper in ("GOLD", "OIL"):
+                if _is_resize and self.steps_in_position < GOLD_OIL_MIN_HOLD_BEFORE_RESIZE:
+                    dir_idx = 0  # too early to resize
+                elif _is_reverse and signal_str < GOLD_OIL_REVERSE_SIGNAL_MIN:
+                    dir_idx = 0  # signal not strong enough for reverse
+            elif _asset_upper == "ETH":
+                if _is_reverse and signal_str < ETH_REVERSE_SIGNAL_MIN:
+                    dir_idx = 0  # ETH also needs reasonable signal for reverse
+
+        # ── v3 G: OIL short-bias guard ───────────────────────────────────────
+        # Block opening another SHORT on OIL when too many recent trades were SHORT.
+        if (USE_ASSET_SPECIFIC_GATES
+                and _asset_upper == "OIL"
+                and not self.in_position
+                and dir_idx == 3  # SHORT
+                and not tp_triggered and not sl_triggered):
+            _recent = self._recent_closed_sides[-OIL_SHORT_BIAS_LOOKBACK:]
+            if len(_recent) >= 3:
+                _short_ratio = sum(1 for s in _recent if s == "SHORT") / len(_recent)
+                if _short_ratio > OIL_SHORT_BIAS_MAX_RATIO and signal_str < OIL_SHORT_BIAS_MIN_SS:
+                    dir_idx = 0  # block SHORT due to one-sided bias
 
         direction  = DIRECTION_NAMES[dir_idx]
         size_label = SIZE_NAMES[size_idx]
@@ -653,7 +927,9 @@ class TradingEnv(gym.Env):
         price_ret         = (price_t - price_prev) / price_prev if price_prev > 0 else 0.0
         effective_pos     = new_position_pct * applied_leverage
         old_effective_pos = old_position_pct * old_leverage
-        pnl_t             = effective_pos * price_ret
+        # New action should affect future returns, not the already completed bar.
+        # USE_OLD_PNL_TIMING=True restores old behavior where new position earns this bar.
+        pnl_t             = (effective_pos if USE_OLD_PNL_TIMING else old_effective_pos) * price_ret
         eff_turnover      = abs(effective_pos - old_effective_pos)
         tc_t              = eff_turnover * self.transaction_cost
 
@@ -692,6 +968,17 @@ class TradingEnv(gym.Env):
         reward_wrong_side_penalty         = 0.0
         reward_tp_bonus                   = float(TP_BONUS_VALUE  if tp_triggered  else 0.0)
         reward_sl_penalty                 = float(SL_PENALTY_VALUE if sl_triggered else 0.0)
+        # v2: small per-event penalties to discourage excessive reversals / resizes
+        reward_reverse_penalty            = float(REVERSE_PENALTY_VALUE if exit_reason == "AGENT_REVERSE" else 0.0)
+        reward_resize_penalty             = float(RESIZE_PENALTY_VALUE  if exit_reason == "AGENT_RESIZE"  else 0.0)
+        # v3 E: reward signal at completed-trade close (uses realized_pnl sign as proxy)
+        reward_loss_close_penalty         = 0.0
+        reward_win_close_bonus            = 0.0
+        if USE_LOSS_CLOSE_PENALTY and closing_now:
+            if realized_pnl > 0:
+                reward_win_close_bonus    = WIN_CLOSE_BONUS.get(_asset_upper, 0.0)
+            elif realized_pnl < 0:
+                reward_loss_close_penalty = LOSS_CLOSE_PENALTY.get(_asset_upper, 0.0)
 
         if old_position_pct == 0.0 and direction in ("HOLD", "FLAT"):
             if (abs(predicted_lr) > self._signal_threshold
@@ -714,6 +1001,10 @@ class TradingEnv(gym.Env):
             - reward_wrong_side_penalty
             + reward_tp_bonus
             - reward_sl_penalty
+            - reward_reverse_penalty
+            - reward_resize_penalty
+            - reward_loss_close_penalty
+            + reward_win_close_bonus
         )
 
         # ── Accumulate per-trade data ─────────────────────────────────────────
@@ -730,6 +1021,8 @@ class TradingEnv(gym.Env):
             self._tacc_rws    += reward_wrong_side_penalty
             self._tacc_rtp    += reward_tp_bonus
             self._tacc_rsl    += reward_sl_penalty
+            # v2 penalties are per-event (only non-zero at trade boundary steps)
+            self._tacc_reward -= reward_reverse_penalty + reward_resize_penalty
             # OHLC high/low tracking during trade (NaN-safe)
             if not np.isnan(high_t):
                 self._tacc_high = max(self._tacc_high, high_t)
@@ -906,16 +1199,30 @@ class TradingEnv(gym.Env):
             if is_flat_now and not dir_changed and not resized:
                 _emit_completed_trade(exit_reason)
                 _reset_trade_state()
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
             elif dir_changed:
                 _emit_completed_trade("AGENT_REVERSE")
                 _reset_trade_state()
                 _open_trade_state(new_position_pct)
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
             elif resized:
                 _emit_completed_trade("AGENT_RESIZE")
                 _reset_trade_state()
                 _open_trade_state(new_position_pct)
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
         elif was_flat and not is_flat_now:
             _open_trade_state(new_position_pct)
+
+        # v3 G: track recent closed-trade sides for OIL short-bias guard
+        if closing_now and _asset_upper == "OIL":
+            _exited_side = "LONG" if old_position_pct > 0 else "SHORT"
+            self._recent_closed_sides.append(_exited_side)
+            # Keep list bounded to avoid unbounded growth
+            if len(self._recent_closed_sides) > OIL_SHORT_BIAS_LOOKBACK * 3:
+                self._recent_closed_sides = self._recent_closed_sides[-OIL_SHORT_BIAS_LOOKBACK:]
 
         self.current_position_pct = new_position_pct
 
@@ -932,6 +1239,10 @@ class TradingEnv(gym.Env):
 
         if self.current_position_pct != 0.0:
             self.steps_in_position += 1
+
+        # Decrement cooldown each step (floored at 0)
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
 
         # ── Metrics ───────────────────────────────────────────────────────────
         self.metrics["total_pnl"] = (
@@ -1044,6 +1355,11 @@ class TradingEnv(gym.Env):
             "reward_wrong_side_penalty":      reward_wrong_side_penalty,
             "reward_tp_bonus":                reward_tp_bonus,
             "reward_sl_penalty":              reward_sl_penalty,
+            "reward_reverse_penalty":         reward_reverse_penalty,
+            "reward_resize_penalty":          reward_resize_penalty,
+            "reward_loss_close_penalty":      reward_loss_close_penalty,
+            "reward_win_close_bonus":         reward_win_close_bonus,
+            "cooldown_remaining":             self._cooldown_remaining,
             "reward":                         float(reward),
         })
 
@@ -1203,6 +1519,7 @@ class TradingEnv(gym.Env):
             "n_steps":                          0,
             "sum_position":                     0.0,
             "direction_counts":                 {i: 0 for i in range(4)},
+            "n_breakeven_stop_updates":         0,  # v3
         }
 
 
