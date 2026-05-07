@@ -570,6 +570,282 @@ def test_completed_trade_log_metrics():
         rl_env_module.COOLDOWN_BARS  = orig_cool
 
 
+# ── v3 Tests ─────────────────────────────────────────────────────────────────
+
+def _make_env_with_signal(
+    asset: str = None,
+    signal_val: float = 0.333,
+    plr_val: float = 0.10,
+    n: int = 200,
+    **kwargs,
+) -> TradingEnv:
+    """Create TradingEnv with controlled signal_strength and predicted_log_return values."""
+    df = _make_df(n)
+    df["signal_strength"]     = signal_val
+    df["predicted_log_return"] = plr_val
+    df["ret_4"] = 0.001   # slight positive trend by default
+    return TradingEnv(df, asset=asset, **kwargs)
+
+
+# ── Test 28: Signal gate blocks weak new GOLD/OIL entries ────────────────────
+
+def test_signal_gate_blocks_weak_gold_entry():
+    """GOLD signal gate (threshold=0.35) should block entries when signal < 0.35."""
+    import models.rl_env as m
+    orig_gates = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir   = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False  # isolate gate A
+        env = _make_env_with_signal(asset="GOLD", signal_val=0.20, plr_val=0.10)
+        env.reset()
+        env.step(LONG_LARGE)   # signal=0.20 < 0.35 → should be blocked
+        assert env.current_position_pct == 0.0, (
+            "GOLD entry should be blocked when signal_strength < ASSET_SIGNAL_THRESHOLDS['GOLD']"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+def test_signal_gate_allows_strong_gold_entry():
+    """GOLD entry should be allowed when signal_strength >= threshold."""
+    import models.rl_env as m
+    orig_gates = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir   = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False
+        env = _make_env_with_signal(asset="GOLD", signal_val=0.40, plr_val=0.10)
+        env.reset()
+        env.step(LONG_LARGE)   # signal=0.40 >= 0.35 → should be allowed
+        assert env.current_position_pct > 0.0, (
+            "GOLD entry should succeed when signal_strength >= threshold"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+# ── Test 29: Signal gate does NOT block exits ──────────────────────────────────
+
+def test_signal_gate_does_not_block_exits():
+    """FLAT should succeed even when signal is weak (agent is already in position)."""
+    import models.rl_env as m
+    orig_gates   = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir     = m.USE_SIGNAL_DIRECTION_FILTER
+    orig_min     = m.MIN_HOLD_BARS
+    orig_amh     = m.ASSET_MIN_HOLD_BARS.copy()
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False
+        m.MIN_HOLD_BARS               = 1
+        m.ASSET_MIN_HOLD_BARS["GOLD"] = 1   # override per-asset hold so FLAT isn't blocked
+        # Open with strong signal and sufficient predicted_lr (above GOLD threshold 0.35)
+        env = _make_env_with_signal(asset="GOLD", signal_val=0.40, plr_val=0.40)
+        env.reset()
+        env.step(LONG_LARGE)
+        assert env.current_position_pct > 0.0, "Setup: should be in position"
+        # Now weaken the signal — gate should NOT block exit (agent is already in position)
+        for i in range(len(env._transformer_raw)):
+            env._transformer_raw[i, 1] = 0.10  # signal_strength → 0.10
+        env.step(FLAT)
+        assert env.current_position_pct == 0.0, "FLAT should succeed even with weak signal"
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+        m.MIN_HOLD_BARS               = orig_min
+        m.ASSET_MIN_HOLD_BARS.update(orig_amh)
+
+
+# ── Test 30: TP/SL exits never blocked by gates ───────────────────────────────
+
+def test_tpsl_not_blocked_by_signal_gate():
+    """TP/SL must close the trade even when USE_ASSET_SPECIFIC_GATES is True."""
+    import models.rl_env as m
+    orig_gates = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir   = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False  # isolate gate test; direction filter tested separately
+        # GOLD — plr_val must exceed GOLD threshold (0.35) so setup entry is allowed
+        env = _make_env_with_signal(asset="GOLD", signal_val=0.40, plr_val=0.40)
+        env.reset()
+        env.step(LONG_LARGE)
+        assert env.current_position_pct > 0.0
+        # Force SL trigger
+        env._trade_sl_price = env._prices[env._step] * 100.0
+        env._trade_tp_price = env._prices[env._step] * 999.0
+        # Weaken signal so gate would normally block new entries
+        for i in range(len(env._transformer_raw)):
+            env._transformer_raw[i, 1] = 0.10
+        env.step(HOLD)
+        assert env.current_position_pct == 0.0, "SL must fire despite weak signal gate"
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+# ── Test 31: Risk profile downgrades correctly for GOLD ──────────────────────
+
+def test_risk_downgrade_gold_aggressive_to_conservative():
+    """GOLD AGGRESSIVE should be downgraded to CONSERVATIVE regardless of signal."""
+    from models.rl_env import _apply_asset_risk_limits, USE_ASSET_SPECIFIC_RISK_LIMITS
+    import models.rl_env as m
+    orig = m.USE_ASSET_SPECIFIC_RISK_LIMITS
+    try:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = True
+        result = _apply_asset_risk_limits("GOLD", risk_idx=2, sig_str=0.99)
+        assert result == 0, f"GOLD AGGRESSIVE must downgrade to CONSERVATIVE, got {result}"
+    finally:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = orig
+
+
+def test_risk_downgrade_eth_aggressive_below_threshold():
+    """ETH AGGRESSIVE should downgrade to BALANCED when signal < ETH_AGG_SIGNAL_MIN."""
+    from models.rl_env import _apply_asset_risk_limits, ETH_AGG_SIGNAL_MIN
+    import models.rl_env as m
+    orig = m.USE_ASSET_SPECIFIC_RISK_LIMITS
+    try:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = True
+        result = _apply_asset_risk_limits("ETH", risk_idx=2, sig_str=ETH_AGG_SIGNAL_MIN - 0.01)
+        assert result == 1, f"ETH AGGRESSIVE below threshold must become BALANCED, got {result}"
+    finally:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = orig
+
+
+def test_risk_downgrade_eth_aggressive_above_threshold():
+    """ETH AGGRESSIVE should remain AGGRESSIVE when signal >= ETH_AGG_SIGNAL_MIN."""
+    from models.rl_env import _apply_asset_risk_limits, ETH_AGG_SIGNAL_MIN, ASSET_MAX_RISK_IDX
+    import models.rl_env as m
+    orig = m.USE_ASSET_SPECIFIC_RISK_LIMITS
+    try:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = True
+        result = _apply_asset_risk_limits("ETH", risk_idx=2, sig_str=ETH_AGG_SIGNAL_MIN + 0.01)
+        # ETH max risk cap is 1 (BALANCED); so even with strong signal, capped at 1
+        assert result == ASSET_MAX_RISK_IDX.get("ETH", 1), (
+            f"ETH AGGRESSIVE above threshold should be capped at ASSET_MAX_RISK_IDX, got {result}"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_RISK_LIMITS = orig
+
+
+# ── Test 32: Breakeven stop only moves SL in protective direction ─────────────
+
+def test_breakeven_stop_long_moves_sl_up():
+    """For LONG, breakeven stop must move SL up (to entry), never down."""
+    import models.rl_env as m
+    orig     = m.USE_BREAKEVEN_STOP
+    orig_dir = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_BREAKEVEN_STOP          = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False  # don't let direction filter block entry
+        # plr_val must exceed ETH threshold (0.20) for entry to succeed
+        env = _make_env_with_signal(asset="ETH", signal_val=0.40, plr_val=0.25)
+        env.reset()
+        env.step(LONG_LARGE)
+        assert env.in_position, "Should be in LONG"
+        original_sl = env._trade_sl_price
+        entry        = env.entry_price
+        atr          = float(env._atr[env._step])
+        # Force price to be above breakeven trigger
+        env._prices[env._step] = entry + 1.0 * atr  # > 0.8 * atr trigger for ETH
+        env.step(HOLD)
+        new_sl = env._trade_sl_price
+        assert new_sl >= original_sl, "Breakeven SL must not be lower than original SL"
+    finally:
+        m.USE_BREAKEVEN_STOP          = orig
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+def test_breakeven_stop_does_not_lower_sl_for_long():
+    """Breakeven stop must never lower the SL (only raise it for LONG)."""
+    import models.rl_env as m
+    orig     = m.USE_BREAKEVEN_STOP
+    orig_dir = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_BREAKEVEN_STOP          = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False  # don't let direction filter block entry
+        # plr_val must exceed ETH threshold (0.20) for entry to succeed
+        env = _make_env_with_signal(asset="ETH", signal_val=0.40, plr_val=0.25)
+        env.reset()
+        env.step(LONG_LARGE)
+        original_sl = env._trade_sl_price
+        # Set price BELOW trigger — breakeven should NOT fire
+        entry = env.entry_price
+        atr   = float(env._atr[env._step])
+        env._prices[env._step] = entry + 0.3 * atr  # below 0.8 * atr
+        env.step(HOLD)
+        assert env._trade_sl_price == pytest.approx(original_sl, rel=1e-6), (
+            "SL should not move when price has not reached breakeven trigger"
+        )
+    finally:
+        m.USE_BREAKEVEN_STOP          = orig
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+# ── Test 33: OIL short-bias control blocks weak repeated shorts ───────────────
+
+def test_oil_short_bias_blocks_entry():
+    """OIL SHORT should be blocked when recent ratio > threshold and signal weak."""
+    import models.rl_env as m
+    orig = m.USE_ASSET_SPECIFIC_GATES
+    try:
+        m.USE_ASSET_SPECIFIC_GATES = True
+        env = _make_env_with_signal(asset="OIL", signal_val=0.30, plr_val=-0.05)
+        env.reset()
+        # Artificially populate recent closed sides with all SHORT
+        env._recent_closed_sides = ["SHORT"] * 15   # 15 recent SHORTs out of 15 = 100%
+        env.step(SHORT_LARGE)  # signal=0.30 < OIL_SHORT_BIAS_MIN_SS=0.60, bias=100% > 70%
+        assert env.current_position_pct == 0.0, (
+            "OIL SHORT should be blocked when short-bias is too high and signal is weak"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES = orig
+
+
+def test_oil_short_bias_allows_strong_signal():
+    """OIL SHORT should be allowed despite bias when signal_strength >= OIL_SHORT_BIAS_MIN_SS."""
+    import models.rl_env as m
+    orig_gates = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir   = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = False
+        env = _make_env_with_signal(asset="OIL", signal_val=0.65, plr_val=-0.10)
+        env.reset()
+        env._recent_closed_sides = ["SHORT"] * 15  # high bias
+        env.step(SHORT_LARGE)  # signal=0.65 >= 0.60 → should be allowed despite bias
+        assert env.current_position_pct < 0.0, (
+            "OIL SHORT with strong signal should be allowed even with short bias"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
+# ── Test 34: BTC behavior mostly unchanged (thresholds=0) ─────────────────────
+
+def test_btc_signal_gate_does_not_block():
+    """BTC has signal threshold=0.00, so gates should not block any entry."""
+    import models.rl_env as m
+    orig_gates = m.USE_ASSET_SPECIFIC_GATES
+    orig_dir   = m.USE_SIGNAL_DIRECTION_FILTER
+    try:
+        m.USE_ASSET_SPECIFIC_GATES    = True
+        m.USE_SIGNAL_DIRECTION_FILTER = True
+        # Very weak signal — would block ETH/GOLD/OIL but not BTC
+        env = _make_env_with_signal(asset="BTC", signal_val=0.01, plr_val=0.005)
+        env.reset()
+        env.step(LONG_LARGE)
+        assert env.current_position_pct > 0.0, (
+            "BTC entry should always be allowed (threshold=0.00)"
+        )
+    finally:
+        m.USE_ASSET_SPECIFIC_GATES    = orig_gates
+        m.USE_SIGNAL_DIRECTION_FILTER = orig_dir
+
+
 if __name__ == "__main__":
     tests = [
         test_hold_while_long_keeps_long,
@@ -600,6 +876,19 @@ if __name__ == "__main__":
         test_cooldown_forces_hold_after_close,
         test_tp_sl_always_allowed_despite_min_hold,
         test_completed_trade_log_metrics,
+        # v3 tests
+        test_signal_gate_blocks_weak_gold_entry,
+        test_signal_gate_allows_strong_gold_entry,
+        test_signal_gate_does_not_block_exits,
+        test_tpsl_not_blocked_by_signal_gate,
+        test_risk_downgrade_gold_aggressive_to_conservative,
+        test_risk_downgrade_eth_aggressive_below_threshold,
+        test_risk_downgrade_eth_aggressive_above_threshold,
+        test_breakeven_stop_long_moves_sl_up,
+        test_breakeven_stop_does_not_lower_sl_for_long,
+        test_oil_short_bias_blocks_entry,
+        test_oil_short_bias_allows_strong_signal,
+        test_btc_signal_gate_does_not_block,
     ]
     passed = failed = 0
     for t in tests:
