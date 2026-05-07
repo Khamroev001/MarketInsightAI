@@ -1,0 +1,25 @@
+openai>=1.0.0
+requests==2.31.0
+psycopg2-binary==2.9.9
+pandas==2.2.0
+numpy
+python-dotenv==1.0.0
+tenacity==8.2.3
+loguru==0.7.2
+yfinance==0.2.54
+ta
+scikit-learn
+sqlalchemy
+gymnasium
+stable-baselines3
+joblib
+torch
+finnhub-python
+matplotlib
+# GDELT + NLP sentiment
+gdeltdoc
+newspaper3k
+lxml_html_clean
+transformers
+# (torch is already listed above — FinBERT needs it)
+pytest

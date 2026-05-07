@@ -1,0 +1,5 @@
+asset,gdelt_file_exists,transformer_saved,ridge_saved,ppo_saved,scaler_saved,price_rows,feature_rows,target_rows,prediction_rows
+BTC,True,True,True,True,True,9395,35673,35673,40515
+ETH,True,True,True,True,True,9392,35673,35673,40514
+GOLD,True,True,True,True,True,7274,42132,42132,46973
+OIL,True,True,True,True,True,7230,42115,42115,46956
