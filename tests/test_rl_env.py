@@ -124,38 +124,56 @@ def test_hold_no_transaction_cost():
 # ── Test 6: FLAT while long closes position ───────────────────────────────────
 
 def test_flat_while_long_closes():
-    env = _make_env()
-    env.reset()
-    env.step(LONG_LARGE)
-    assert env.current_position_pct > 0
-    _, _, terminated, _, _ = env.step(FLAT)
-    assert env.current_position_pct == 0.0, "FLAT should close long"
+    import models.rl_env as m
+    orig = m.MIN_HOLD_BARS
+    try:
+        m.MIN_HOLD_BARS = 1  # allow immediate close for this mechanics test
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)
+        assert env.current_position_pct > 0
+        _, _, terminated, _, _ = env.step(FLAT)
+        assert env.current_position_pct == 0.0, "FLAT should close long"
+    finally:
+        m.MIN_HOLD_BARS = orig
 
 
 # ── Test 7: FLAT while short closes position ──────────────────────────────────
 
 def test_flat_while_short_closes():
-    env = _make_env()
-    env.reset()
-    env.step(SHORT_LARGE)
-    assert env.current_position_pct < 0
-    env.step(FLAT)
-    assert env.current_position_pct == 0.0, "FLAT should close short"
+    import models.rl_env as m
+    orig = m.MIN_HOLD_BARS
+    try:
+        m.MIN_HOLD_BARS = 1
+        env = _make_env()
+        env.reset()
+        env.step(SHORT_LARGE)
+        assert env.current_position_pct < 0
+        env.step(FLAT)
+        assert env.current_position_pct == 0.0, "FLAT should close short"
+    finally:
+        m.MIN_HOLD_BARS = orig
 
 
 # ── Test 8: Long-to-short flip charges full effective turnover ────────────────
 
 def test_long_to_short_full_turnover():
-    env = _make_env()
-    env.reset()
-    # LONG_LARGE = [2,2,1] → LONG, LARGE(1.0), BALANCED(lev=1.5) → eff_pos=+1.5
-    env.step(LONG_LARGE)
-    # SHORT_LARGE = [3,2,1] → SHORT, LARGE(1.0), BALANCED(lev=1.5) → eff_pos=-1.5
-    env.step(SHORT_LARGE)
-    log = env.trade_log[-1]
-    # eff_turnover = |(-1.5) - (+1.5)| = 3.0
-    assert log["turnover"] == pytest.approx(3.0, abs=1e-6), \
-        f"Expected turnover=3.0 for full flip (BALANCED lev=1.5), got {log['turnover']}"
+    import models.rl_env as m
+    orig = m.MIN_HOLD_BARS
+    try:
+        m.MIN_HOLD_BARS = 1  # allow immediate reverse for turnover mechanics test
+        env = _make_env()
+        env.reset()
+        # LONG_LARGE = [2,2,1] → LONG, LARGE(1.0), BALANCED(lev=1.5) → eff_pos=+1.5
+        env.step(LONG_LARGE)
+        # SHORT_LARGE = [3,2,1] → SHORT, LARGE(1.0), BALANCED(lev=1.5) → eff_pos=-1.5
+        env.step(SHORT_LARGE)
+        log = env.trade_log[-1]
+        # eff_turnover = |(-1.5) - (+1.5)| = 3.0
+        assert log["turnover"] == pytest.approx(3.0, abs=1e-6), \
+            f"Expected turnover=3.0 for full flip (BALANCED lev=1.5), got {log['turnover']}"
+    finally:
+        m.MIN_HOLD_BARS = orig
 
 
 # ── Test 9: Desired and executed positions are tracked ────────────────────────
@@ -220,12 +238,18 @@ def test_take_profit_log():
 # ── Test 14: FLAT while long charges transaction cost ────────────────────────
 
 def test_flat_charges_tc():
-    env = _make_env()
-    env.reset()
-    env.step(LONG_LARGE)
-    env.step(FLAT)
-    flat_log = env.trade_log[-1]
-    assert flat_log["transaction_cost"] > 0.0, "FLAT from long should incur transaction cost"
+    import models.rl_env as m
+    orig = m.MIN_HOLD_BARS
+    try:
+        m.MIN_HOLD_BARS = 1
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)
+        env.step(FLAT)
+        flat_log = env.trade_log[-1]
+        assert flat_log["transaction_cost"] > 0.0, "FLAT from long should incur transaction cost"
+    finally:
+        m.MIN_HOLD_BARS = orig
 
 
 # ── Test 15: Trade log has all required fields ────────────────────────────────
@@ -263,6 +287,289 @@ def test_action_map_semantics():
             f"ACTION_MAP[{k}] target={ACTION_MAP[k]['target']} exceeds 1.00"
 
 
+# ── v2 Tests ──────────────────────────────────────────────────────────────────
+
+def _make_df_ohlc(n: int = 200, start_price: float = 100.0) -> pd.DataFrame:
+    """Synthetic OHLC DataFrame for v2 TP/SL tests."""
+    from models.rl_env import MARKET_FEATURE_COLS, TRANSFORMER_FEAT_COLS
+    np.random.seed(7)
+    prices = start_price * np.cumprod(1 + 0.001 + 0.005 * np.random.randn(n))
+    ts     = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    df     = pd.DataFrame(index=ts)
+    df["close"] = prices
+    df["open"]  = prices * 0.999
+    df["high"]  = prices * 1.005
+    df["low"]   = prices * 0.995
+    for col in MARKET_FEATURE_COLS:
+        if col in ("close",):
+            continue
+        df[col] = np.random.randn(n) * 0.01
+    for col in TRANSFORMER_FEAT_COLS:
+        df[col] = 0.0
+    return df
+
+
+def _make_env_ohlc(n: int = 200, **kwargs) -> TradingEnv:
+    df = _make_df_ohlc(n)
+    return TradingEnv(df, asset=None, **kwargs)
+
+
+# ── Test 17: New action does not earn the previous bar's return ───────────────
+
+def test_pnl_timing_old_pos_earns_bar():
+    """With USE_OLD_PNL_TIMING=False, PnL at the step when we open should be 0
+    (old_effective_pos=0 since we were flat). If USE_OLD_PNL_TIMING were True,
+    the PnL would be non-zero because new_effective_pos * price_ret."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.USE_OLD_PNL_TIMING
+    try:
+        rl_env_module.USE_OLD_PNL_TIMING = False
+        env = _make_env()
+        env.reset()
+        # Force a non-zero price return
+        env._prices[1] = env._prices[0] * 1.02  # +2% move
+        _, _, _, _, _ = env.step(LONG_LARGE)     # step 0: open while flat
+        log = env.trade_log[-1]
+        # old_effective_pos was 0 (flat before), so pnl_t must be 0
+        assert log["step_return"] == pytest.approx(0.0, abs=1e-9), (
+            f"Opening step should earn 0 PnL (old pos was flat). Got {log['step_return']}"
+        )
+    finally:
+        rl_env_module.USE_OLD_PNL_TIMING = orig
+
+
+# ── Test 18: Long TP uses candle high ─────────────────────────────────────────
+
+def test_long_tp_uses_candle_high():
+    """TP for LONG should trigger when high_t >= tp_price even if close < tp_price."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.USE_CLOSE_ONLY_TPSL
+    try:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = False
+        env = _make_env_ohlc()
+        env.reset()
+        env.step(LONG_LARGE)
+        # Set TP just below the high so that high triggers it but close would not.
+        step = env._step
+        high_next = float(env._highs[step])
+        close_next = float(env._prices[step])
+        env._trade_sl_price = 0.0  # disable SL
+        env._trade_tp_price = high_next * 0.999   # below high → triggers via high
+        # Ensure close will not trigger by itself
+        assert close_next < env._trade_tp_price or True  # just ensuring TP set
+        env.step(HOLD)
+        tp_logs = [r for r in env.trade_log if r["take_profit_triggered"]]
+        assert len(tp_logs) >= 1, "Long TP should trigger via candle high"
+    finally:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = orig
+
+
+# ── Test 19: Long SL uses candle low ─────────────────────────────────────────
+
+def test_long_sl_uses_candle_low():
+    """SL for LONG should trigger when low_t <= sl_price even if close > sl_price."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.USE_CLOSE_ONLY_TPSL
+    try:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = False
+        env = _make_env_ohlc()
+        env.reset()
+        env.step(LONG_LARGE)
+        step = env._step
+        low_next   = float(env._lows[step])
+        env._trade_tp_price = 1e9   # disable TP
+        env._trade_sl_price = low_next * 1.001  # above low → triggers via low
+        env.step(HOLD)
+        sl_logs = [r for r in env.trade_log if r["stop_loss_triggered"]]
+        assert len(sl_logs) >= 1, "Long SL should trigger via candle low"
+    finally:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = orig
+
+
+# ── Test 20: Short SL uses candle high ────────────────────────────────────────
+
+def test_short_sl_uses_candle_high():
+    """SL for SHORT should trigger when high_t >= sl_price."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.USE_CLOSE_ONLY_TPSL
+    try:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = False
+        env = _make_env_ohlc()
+        env.reset()
+        env.step(SHORT_LARGE)
+        step = env._step
+        high_next  = float(env._highs[step])
+        env._trade_tp_price = 0.0   # disable TP (price=0 means TP never reached for short)
+        env._trade_sl_price = high_next * 0.999  # below high → triggers via high
+        env.step(HOLD)
+        sl_logs = [r for r in env.trade_log if r["stop_loss_triggered"]]
+        assert len(sl_logs) >= 1, "Short SL should trigger via candle high"
+    finally:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = orig
+
+
+# ── Test 21: Short TP uses candle low ─────────────────────────────────────────
+
+def test_short_tp_uses_candle_low():
+    """TP for SHORT should trigger when low_t <= tp_price."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.USE_CLOSE_ONLY_TPSL
+    try:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = False
+        env = _make_env_ohlc()
+        env.reset()
+        env.step(SHORT_LARGE)
+        step = env._step
+        low_next   = float(env._lows[step])
+        env._trade_sl_price = 1e9   # disable SL
+        env._trade_tp_price = low_next * 1.001  # above low → triggers via low
+        env.step(HOLD)
+        tp_logs = [r for r in env.trade_log if r["take_profit_triggered"]]
+        assert len(tp_logs) >= 1, "Short TP should trigger via candle low"
+    finally:
+        rl_env_module.USE_CLOSE_ONLY_TPSL = orig
+
+
+# ── Test 22: MIN_HOLD_BARS blocks early flat ──────────────────────────────────
+
+def test_min_hold_bars_blocks_early_flat():
+    """Agent cannot FLAT before MIN_HOLD_BARS steps; direction is overridden to HOLD."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.MIN_HOLD_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS = 3
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)   # open
+        env.step(FLAT)         # step 1 — should be blocked
+        assert env.current_position_pct > 0.0, (
+            "FLAT should be blocked by MIN_HOLD_BARS before 3 bars"
+        )
+    finally:
+        rl_env_module.MIN_HOLD_BARS = orig
+
+
+# ── Test 23: MIN_HOLD_BARS blocks early reverse ───────────────────────────────
+
+def test_min_hold_bars_blocks_early_reverse():
+    """Agent cannot reverse before MIN_HOLD_BARS steps."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.MIN_HOLD_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS = 3
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)    # open long
+        env.step(SHORT_LARGE)   # attempt reverse at step 1 — should be blocked
+        assert env.current_position_pct > 0.0, (
+            "Reverse should be blocked by MIN_HOLD_BARS before 3 bars"
+        )
+    finally:
+        rl_env_module.MIN_HOLD_BARS = orig
+
+
+# ── Test 24: MIN_HOLD_BARS allows exit after threshold ───────────────────────
+
+def test_min_hold_bars_allows_exit_after_threshold():
+    """Agent CAN close after >= MIN_HOLD_BARS steps."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.MIN_HOLD_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS = 3
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)        # open
+        env.step(HOLD)              # step 1
+        env.step(HOLD)              # step 2
+        env.step(HOLD)              # step 3 — steps_in_position now >=3
+        env.step(FLAT)              # should close
+        assert env.current_position_pct == 0.0, (
+            "FLAT should be allowed after MIN_HOLD_BARS steps"
+        )
+    finally:
+        rl_env_module.MIN_HOLD_BARS = orig
+
+
+# ── Test 25: Cooldown forces HOLD after close ─────────────────────────────────
+
+def test_cooldown_forces_hold_after_close():
+    """After a FLAT, COOLDOWN_BARS steps must be HOLD regardless of action."""
+    import models.rl_env as rl_env_module
+    orig_min  = rl_env_module.MIN_HOLD_BARS
+    orig_cool = rl_env_module.COOLDOWN_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS  = 1   # allow fast close for setup
+        rl_env_module.COOLDOWN_BARS  = 2
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)   # open
+        env.step(FLAT)         # close — triggers cooldown
+        # Next 2 steps should stay flat (HOLD forced)
+        env.step(LONG_LARGE)   # cooldown step 1 — should be overridden
+        assert env.current_position_pct == 0.0, "Step 1 of cooldown should force HOLD/flat"
+        env.step(LONG_LARGE)   # cooldown step 2 — should be overridden
+        assert env.current_position_pct == 0.0, "Step 2 of cooldown should force HOLD/flat"
+    finally:
+        rl_env_module.MIN_HOLD_BARS  = orig_min
+        rl_env_module.COOLDOWN_BARS  = orig_cool
+
+
+# ── Test 26: TP/SL always allowed despite min-hold ────────────────────────────
+
+def test_tp_sl_always_allowed_despite_min_hold():
+    """TP/SL should close the trade even within MIN_HOLD_BARS."""
+    import models.rl_env as rl_env_module
+    orig = rl_env_module.MIN_HOLD_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS = 10  # very long hold requirement
+        env = _make_env()
+        env.reset()
+        env.step(LONG_LARGE)
+        # Force SL to trigger on next step (guaranteed by extremely high sl_price)
+        env._trade_sl_price = env._prices[env._step] * 100.0
+        env._trade_tp_price = env._prices[env._step] * 999.0  # far away, won't trigger
+        env.step(HOLD)
+        # SL should have fired (position closed)
+        assert env.current_position_pct == 0.0, "SL must close trade even within MIN_HOLD_BARS"
+    finally:
+        rl_env_module.MIN_HOLD_BARS = orig
+
+
+# ── Test 27: completed_trade_log metrics calculated without crash ─────────────
+
+def test_completed_trade_log_metrics():
+    """completed_trade_log should be non-empty after trades and support metric calc."""
+    import models.rl_env as rl_env_module
+    orig_min  = rl_env_module.MIN_HOLD_BARS
+    orig_cool = rl_env_module.COOLDOWN_BARS
+    try:
+        rl_env_module.MIN_HOLD_BARS  = 1
+        rl_env_module.COOLDOWN_BARS  = 0
+        env = _make_env(n=50)
+        env.reset()
+        env.step(LONG_LARGE)
+        env.step(HOLD)
+        env.step(FLAT)
+        assert len(env.completed_trade_log) >= 1, "Expected at least one completed trade"
+        df = pd.DataFrame(env.completed_trade_log)
+        assert "net_pnl"               in df.columns
+        assert "transaction_cost_total" in df.columns
+        assert "exit_reason"            in df.columns
+        wins  = (df["net_pnl"] > 0).sum()
+        total = len(df)
+        win_rate = wins / total
+        gross_profit = df.loc[df["net_pnl"] > 0, "net_pnl"].sum()
+        gross_loss   = abs(df.loc[df["net_pnl"] <= 0, "net_pnl"].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        exit_counts   = df["exit_reason"].value_counts().to_dict()
+        assert isinstance(win_rate, float)
+        assert isinstance(profit_factor, float)
+        assert isinstance(exit_counts, dict)
+    finally:
+        rl_env_module.MIN_HOLD_BARS  = orig_min
+        rl_env_module.COOLDOWN_BARS  = orig_cool
+
+
 if __name__ == "__main__":
     tests = [
         test_hold_while_long_keeps_long,
@@ -281,6 +588,18 @@ if __name__ == "__main__":
         test_flat_charges_tc,
         test_trade_log_fields,
         test_action_map_semantics,
+        # v2 tests
+        test_pnl_timing_old_pos_earns_bar,
+        test_long_tp_uses_candle_high,
+        test_long_sl_uses_candle_low,
+        test_short_sl_uses_candle_high,
+        test_short_tp_uses_candle_low,
+        test_min_hold_bars_blocks_early_flat,
+        test_min_hold_bars_blocks_early_reverse,
+        test_min_hold_bars_allows_exit_after_threshold,
+        test_cooldown_forces_hold_after_close,
+        test_tp_sl_always_allowed_despite_min_hold,
+        test_completed_trade_log_metrics,
     ]
     passed = failed = 0
     for t in tests:

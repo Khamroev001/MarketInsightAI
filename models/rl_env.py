@@ -81,6 +81,29 @@ SL_PENALTY_VALUE        = 0.005
 
 SAVED_DIR = Path(__file__).parent / "saved"
 
+# ── v2 Feature Flags ──────────────────────────────────────────────────────────
+# USE_OLD_PNL_TIMING=True → old behavior: new position earns the current bar.
+# USE_OLD_PNL_TIMING=False → new (correct): old position earns the current bar;
+#   new action only affects future returns.
+USE_OLD_PNL_TIMING    = False
+
+# USE_CLOSE_ONLY_TPSL=True → old behavior: TP/SL checked against close price only.
+# USE_CLOSE_ONLY_TPSL=False → new: LONG SL uses candle low, TP uses candle high;
+#   SHORT SL uses candle high, TP uses candle low. SL always takes priority.
+USE_CLOSE_ONLY_TPSL   = False
+
+# Minimum bars a trade must be held before agent can close/resize/reverse.
+# TP/SL exits are always allowed regardless of this setting.
+MIN_HOLD_BARS         = 3
+
+# Bars agent is forced to HOLD after any close/resize/reverse (reduces overtrading).
+# TP/SL exits still trigger cooldown; forced TP/SL exits bypass cooldown enforcement.
+COOLDOWN_BARS         = 2
+
+# Per-event reward penalties for reverse and resize (tunable here or as __init__ params).
+REVERSE_PENALTY_VALUE = 0.003
+RESIZE_PENALTY_VALUE  = 0.0015
+
 # ── MultiDiscrete action decoders ─────────────────────────────────────────────
 
 DIRECTION_NAMES = {0: "HOLD", 1: "FLAT", 2: "LONG", 3: "SHORT"}
@@ -485,7 +508,9 @@ class TradingEnv(gym.Env):
         self.completed_trade_log     = []
         self._step                   = 0
         self.done                    = False
-        self._tacc_portfolio_delta = 0.0
+        self._tacc_portfolio_delta   = 0.0
+        # v2: cooldown / min-hold tracking
+        self._cooldown_remaining     = 0
 
     # ── Gym interface ─────────────────────────────────────────────────────────
 
@@ -545,18 +570,33 @@ class TradingEnv(gym.Env):
         max_hold_triggered = False
 
         if self.in_position and self._trade_sl_price is not None:
-            if self.trade_side == 1:
-                if price_t <= self._trade_sl_price:
+            _tp = self._trade_tp_price  # may be None (e.g. in tests that only set SL)
+            if self.trade_side == 1:  # LONG
+                if USE_CLOSE_ONLY_TPSL:
+                    _sl_hit = price_t <= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (price_t >= _tp)
+                else:
+                    # Use candle low for SL, high for TP. SL takes priority if both hit.
+                    _sl_hit = low_t  <= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (high_t >= _tp)
+                if _sl_hit:
                     dir_idx, sl_triggered = 1, True
                     self.metrics["n_stop_losses_hit"] += 1
-                elif price_t >= self._trade_tp_price:
+                elif _tp_hit:
                     dir_idx, tp_triggered = 1, True
                     self.metrics["n_take_profits_hit"] += 1
-            elif self.trade_side == -1:
-                if price_t >= self._trade_sl_price:
+            elif self.trade_side == -1:  # SHORT
+                if USE_CLOSE_ONLY_TPSL:
+                    _sl_hit = price_t >= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (price_t <= _tp)
+                else:
+                    # Use candle high for SL, low for TP. SL takes priority if both hit.
+                    _sl_hit = high_t >= self._trade_sl_price
+                    _tp_hit = (_tp is not None) and (low_t <= _tp)
+                if _sl_hit:
                     dir_idx, sl_triggered = 1, True
                     self.metrics["n_stop_losses_hit"] += 1
-                elif price_t <= self._trade_tp_price:
+                elif _tp_hit:
                     dir_idx, tp_triggered = 1, True
                     self.metrics["n_take_profits_hit"] += 1
 
@@ -564,6 +604,24 @@ class TradingEnv(gym.Env):
                     and self.steps_in_position >= self._max_holding_bars):
                 dir_idx, max_hold_triggered = 1, True
                 self.metrics["n_max_hold_exits"] += 1
+
+        # ── Cooldown: force HOLD for COOLDOWN_BARS steps after any close ────────
+        # TP/SL overrides skip cooldown enforcement (already set dir_idx=1).
+        if (self._cooldown_remaining > 0
+                and not tp_triggered and not sl_triggered and not max_hold_triggered):
+            dir_idx = 0  # HOLD
+
+        # ── Min-hold: block early close/reverse/resize (not TP/SL/MAX_HOLD) ──
+        if (self.in_position
+                and not tp_triggered and not sl_triggered and not max_hold_triggered
+                and self.steps_in_position < MIN_HOLD_BARS):
+            # Only block if agent is trying to exit or reverse
+            _new_sign = (1.0 if dir_idx == 2 else -1.0) if dir_idx in (2, 3) else 0.0
+            _old_sign = float(np.sign(self.current_position_pct))
+            _agent_wants_exit = (dir_idx == 1 or  # FLAT
+                                 (dir_idx in (2, 3) and _new_sign != _old_sign))  # reverse
+            if _agent_wants_exit:
+                dir_idx = 0  # HOLD
 
         direction  = DIRECTION_NAMES[dir_idx]
         size_label = SIZE_NAMES[size_idx]
@@ -653,7 +711,9 @@ class TradingEnv(gym.Env):
         price_ret         = (price_t - price_prev) / price_prev if price_prev > 0 else 0.0
         effective_pos     = new_position_pct * applied_leverage
         old_effective_pos = old_position_pct * old_leverage
-        pnl_t             = effective_pos * price_ret
+        # New action should affect future returns, not the already completed bar.
+        # USE_OLD_PNL_TIMING=True restores old behavior where new position earns this bar.
+        pnl_t             = (effective_pos if USE_OLD_PNL_TIMING else old_effective_pos) * price_ret
         eff_turnover      = abs(effective_pos - old_effective_pos)
         tc_t              = eff_turnover * self.transaction_cost
 
@@ -692,6 +752,9 @@ class TradingEnv(gym.Env):
         reward_wrong_side_penalty         = 0.0
         reward_tp_bonus                   = float(TP_BONUS_VALUE  if tp_triggered  else 0.0)
         reward_sl_penalty                 = float(SL_PENALTY_VALUE if sl_triggered else 0.0)
+        # v2: small per-event penalties to discourage excessive reversals / resizes
+        reward_reverse_penalty            = float(REVERSE_PENALTY_VALUE if exit_reason == "AGENT_REVERSE" else 0.0)
+        reward_resize_penalty             = float(RESIZE_PENALTY_VALUE  if exit_reason == "AGENT_RESIZE"  else 0.0)
 
         if old_position_pct == 0.0 and direction in ("HOLD", "FLAT"):
             if (abs(predicted_lr) > self._signal_threshold
@@ -714,6 +777,8 @@ class TradingEnv(gym.Env):
             - reward_wrong_side_penalty
             + reward_tp_bonus
             - reward_sl_penalty
+            - reward_reverse_penalty
+            - reward_resize_penalty
         )
 
         # ── Accumulate per-trade data ─────────────────────────────────────────
@@ -730,6 +795,8 @@ class TradingEnv(gym.Env):
             self._tacc_rws    += reward_wrong_side_penalty
             self._tacc_rtp    += reward_tp_bonus
             self._tacc_rsl    += reward_sl_penalty
+            # v2 penalties are per-event (only non-zero at trade boundary steps)
+            self._tacc_reward -= reward_reverse_penalty + reward_resize_penalty
             # OHLC high/low tracking during trade (NaN-safe)
             if not np.isnan(high_t):
                 self._tacc_high = max(self._tacc_high, high_t)
@@ -906,14 +973,20 @@ class TradingEnv(gym.Env):
             if is_flat_now and not dir_changed and not resized:
                 _emit_completed_trade(exit_reason)
                 _reset_trade_state()
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
             elif dir_changed:
                 _emit_completed_trade("AGENT_REVERSE")
                 _reset_trade_state()
                 _open_trade_state(new_position_pct)
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
             elif resized:
                 _emit_completed_trade("AGENT_RESIZE")
                 _reset_trade_state()
                 _open_trade_state(new_position_pct)
+                # +1 compensates for the same-step decrement at step bottom
+                self._cooldown_remaining = COOLDOWN_BARS + 1
         elif was_flat and not is_flat_now:
             _open_trade_state(new_position_pct)
 
@@ -932,6 +1005,10 @@ class TradingEnv(gym.Env):
 
         if self.current_position_pct != 0.0:
             self.steps_in_position += 1
+
+        # Decrement cooldown each step (floored at 0)
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
 
         # ── Metrics ───────────────────────────────────────────────────────────
         self.metrics["total_pnl"] = (
@@ -1044,6 +1121,9 @@ class TradingEnv(gym.Env):
             "reward_wrong_side_penalty":      reward_wrong_side_penalty,
             "reward_tp_bonus":                reward_tp_bonus,
             "reward_sl_penalty":              reward_sl_penalty,
+            "reward_reverse_penalty":         reward_reverse_penalty,
+            "reward_resize_penalty":          reward_resize_penalty,
+            "cooldown_remaining":             self._cooldown_remaining,
             "reward":                         float(reward),
         })
 
