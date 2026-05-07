@@ -560,70 +560,60 @@ with tabs[4]:
                     if c in trans_metrics.columns]
     st.dataframe(trans_metrics[display_cols].round(5), use_container_width=True, hide_index=True)
 
-# Individual metric bar charts
-st.markdown("#### Per-Asset Metric Charts")
-def _metric_chart_or_empty(df, metric, title, key):
-    if metric in df.columns and df[metric].notna().any():
-        st.plotly_chart(
-            charts.make_metrics_bar(df, metric, title),
-            use_container_width=True,
-            key=key,
-        )
-    else:
-        st.info(f"No {metric} data")
-# Row 1: regression metrics
-r1c1, r1c2, r1c3 = st.columns(3)
-with r1c1:
-    _metric_chart_or_empty(trans_metrics, "MAE", "MAE (lower = better)", "eval_mae_tf")
-with r1c2:
-    _metric_chart_or_empty(trans_metrics, "RMSE", "RMSE (lower = better)", "eval_rmse_tf")
-with r1c3:
-    _metric_chart_or_empty(trans_metrics, "R2", "R² (0 = no explanatory power)", "eval_r2_tf")
-# Row 2: signal quality metrics
-r2c1, r2c2, r2c3 = st.columns(3)
-with r2c1:
-    _metric_chart_or_empty(trans_metrics, "Corr", "Pearson Correlation", "eval_corr_tf")
-with r2c2:
-    _metric_chart_or_empty(trans_metrics, "DirAcc", "Direction Accuracy", "eval_diracc_tf")
-with r2c3:
-    _metric_chart_or_empty(trans_metrics, "StdRatio", "Prediction Std Ratio", "eval_stdratio_tf")
-with col3:
-    st.plotly_chart(
-        charts.make_metrics_bar(trans_metrics, "DirAcc", "Direction Accuracy"),
-        use_container_width=True,
-        key="eval_diracc",
-    )
 
-with col4:
-    if "StdRatio" in trans_metrics.columns:
-        st.plotly_chart(
-            charts.make_metrics_bar(trans_metrics, "StdRatio", "Prediction Std Ratio"),
-            use_container_width=True,
-            key="eval_stdratio",
-        )
-    else:
-        st.info("No StdRatio data")
+    # Individual metric bar charts
+    st.markdown("#### Per-Asset Metric Charts")
+
+    def _metric_chart_or_empty(df, metric, title, key):
+        if metric in df.columns and df[metric].notna().any():
+            st.plotly_chart(
+                charts.make_metrics_bar(df, metric, title),
+                use_container_width=True,
+                key=key,
+            )
+        else:
+            st.info(f"No {metric} data")
+
+    # Row 1: regression metrics
+    eval_r1c1, eval_r1c2, eval_r1c3 = st.columns(3)
+    with eval_r1c1:
+        _metric_chart_or_empty(trans_metrics, "MAE", "MAE (lower = better)", "eval_mae_tf")
+    with eval_r1c2:
+        _metric_chart_or_empty(trans_metrics, "RMSE", "RMSE (lower = better)", "eval_rmse_tf")
+    with eval_r1c3:
+        _metric_chart_or_empty(trans_metrics, "R2", "R? (0 = no explanatory power)", "eval_r2_tf")
+
+    # Row 2: signal quality metrics
+    eval_r2c1, eval_r2c2, eval_r2c3 = st.columns(3)
+    with eval_r2c1:
+        _metric_chart_or_empty(trans_metrics, "Corr", "Pearson Correlation", "eval_corr_tf")
+    with eval_r2c2:
+        _metric_chart_or_empty(trans_metrics, "DirAcc", "Direction Accuracy", "eval_diracc_tf")
+    with eval_r2c3:
+        _metric_chart_or_empty(trans_metrics, "StdRatio", "Prediction Std Ratio", "eval_stdratio_tf")
 
     # Residual analysis per asset
     if not preds.empty:
         st.divider()
         st.markdown("#### Residual Analysis")
         asset_tabs2 = st.tabs(ALL_ASSETS if asset_sel == "All" else [asset_sel])
+
         for i, a in enumerate(ALL_ASSETS if asset_sel == "All" else [asset_sel]):
             with asset_tabs2[i]:
-                col_a, col_b = st.columns(2)
-                with col_a:
+                eval_col_a, eval_col_b = st.columns(2)
+                with eval_col_a:
                     st.plotly_chart(
                         charts.make_error_histogram(preds, a),
                         use_container_width=True,
                         key=f"eval_error_hist_{a}",
                     )
-                with col_b:
+                with eval_col_b:
                     st.plotly_chart(
                         charts.make_rolling_mae(preds, a),
                         use_container_width=True,
                         key=f"eval_rolling_mae_{a}",
                     )
+
                 st.plotly_chart(
                     charts.make_predictions_scatter(preds, a),
                     use_container_width=True,
@@ -631,9 +621,6 @@ with col4:
                 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — PPO TRADING AGENT
-# ══════════════════════════════════════════════════════════════════════════════
 _RL_INITIAL_CAP = 10_000.0  # must match INITIAL_CASH in rl_env.py
 
 with tabs[5]:
