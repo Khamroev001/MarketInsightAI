@@ -764,9 +764,10 @@ class TradingEnv(gym.Env):
                 dir_idx = 0  # HOLD
 
         # ── v3 A: Signal-strength gate — block weak new entries ──────────────
-        # V3: trade-quality gate to avoid low-confidence PPO entries.
         # Only blocks opening NEW positions; exits and holds are always allowed.
         # TP/SL overrides are never blocked.
+        # Gate is skipped when signal_str == 0 AND predicted_lr == 0: that means
+        # no transformer prediction exists for this bar, not a genuinely weak signal.
         if (USE_ASSET_SPECIFIC_GATES
                 and not tp_triggered and not sl_triggered and not max_hold_triggered
                 and not self.in_position
@@ -774,18 +775,20 @@ class TradingEnv(gym.Env):
             _gate_thr = ASSET_SIGNAL_THRESHOLDS.get(_asset_upper, 0.0)
             if _gate_thr > 0.0:
                 _gate_sig = signal_str if signal_str > 0 else abs(predicted_lr)
-                if _gate_sig < _gate_thr:
-                    dir_idx = 0  # HOLD — signal too weak to open
+                _has_prediction = _gate_sig > 0.0  # 0 = no prediction for this bar
+                if _has_prediction and _gate_sig < _gate_thr:
+                    dir_idx = 0  # HOLD — signal exists but is too weak
 
         # ── v3 B: Direction-agreement filter for new entries ─────────────────
         # Require that the predicted direction agrees with recent price trend.
         # Only applied for new entries (flat→long/short), never for exits.
+        # Skipped when predicted_lr == 0 (no prediction for this bar).
         if (USE_SIGNAL_DIRECTION_FILTER
                 and not tp_triggered and not sl_triggered and not max_hold_triggered
                 and not self.in_position
                 and dir_idx in (2, 3)):
             _gate_thr = ASSET_SIGNAL_THRESHOLDS.get(_asset_upper, 0.0)
-            if _gate_thr > 0.0:  # skip direction filter for BTC (threshold=0)
+            if _gate_thr > 0.0 and predicted_lr != 0.0:  # skip when no prediction exists
                 _trend = float(self._ret4_raw[idx]) if idx > 0 else 0.0
                 if _trend == 0.0:
                     _trend = float(self._ret1_raw[idx]) if idx > 0 else 0.0
